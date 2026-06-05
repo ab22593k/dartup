@@ -1,0 +1,200 @@
+use crate::config;
+use crate::util::{dir_size, human_size};
+use anyhow::{Context, Result};
+use colored::Colorize;
+use std::path::PathBuf;
+
+/// List all installed Flutter versions
+pub fn list_versions() -> Result<()> {
+    let envs_dir = config::envs_dir();
+    if !envs_dir.exists() {
+        println!("No Flutter versions installed yet.");
+        return Ok(());
+    }
+
+    let current = get_current_symlink_target()?;
+
+    println!("{}", "Installed Flutter versions:".bold());
+    let mut found = false;
+
+    for entry in std::fs::read_dir(&envs_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_active = current
+                .as_ref()
+                .is_some_and(|c| path == *c || name == get_current_version_name());
+
+            if is_active {
+                println!("  {} {}", name.green().bold(), "(active)".green());
+            } else {
+                println!("  {}", name);
+            }
+            found = true;
+        }
+    }
+
+    if !found {
+        println!("  (no versions installed)");
+    }
+
+    Ok(())
+}
+
+/// Get the current version name from the global symlink
+fn get_current_version_name() -> String {
+    let global_path = config::global_default_path();
+    if global_path.is_symlink()
+        && let Ok(target) = std::fs::read_link(&global_path)
+        && let Some(name) = target.file_name()
+    {
+        return name.to_string_lossy().to_string();
+    }
+    String::new()
+}
+
+/// Get the path the global symlink points to
+fn get_current_symlink_target() -> Result<Option<PathBuf>> {
+    let global_path = config::global_default_path();
+    if global_path.is_symlink() {
+        let target = std::fs::read_link(&global_path)?;
+        Ok(Some(target))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Show currently active Flutter version
+pub fn show_current() -> Result<()> {
+    // Check project config first
+    if let Some(project_version) = crate::project::read_project_version()? {
+        println!(
+            "Project: {} (from .dartup.json)",
+            project_version.green().bold()
+        );
+    }
+
+    let global_path = config::global_default_path();
+    if global_path.is_symlink() {
+        let target = std::fs::read_link(&global_path)?;
+        if let Some(name) = target.file_name() {
+            println!(
+                "Global:  {} → {}",
+                name.to_string_lossy().green().bold(),
+                target.display()
+            );
+        }
+    } else {
+        println!("No global default set. Use 'dartup use -g <version>' to set one.");
+    }
+
+    Ok(())
+}
+
+/// Set the global default version
+pub fn set_global(version: &str) -> Result<()> {
+    let env_dir = config::envs_dir().join(version);
+    if !env_dir.join("bin").join("flutter").exists()
+        && !env_dir.join("bin").join("flutter.bat").exists()
+    {
+        anyhow::bail!("Flutter {version} is not installed. Run 'dartup install {version}' first.");
+    }
+
+    let global_path = config::global_default_path();
+
+    // Remove existing symlink if any
+    if global_path.exists() || global_path.is_symlink() {
+        std::fs::remove_file(&global_path)?;
+    }
+
+    // Create new symlink
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&env_dir, &global_path)
+        .context("Failed to create global symlink")?;
+
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&env_dir, &global_path)
+        .context("Failed to create global symlink")?;
+
+    println!(
+        "✅ Global default set to Flutter {}.",
+        version.green().bold()
+    );
+    println!(
+        "   Add {} to your PATH to use 'dartup flutter'",
+        config::envs_dir().join(version).join("bin").display()
+    );
+    Ok(())
+}
+
+/// Remove an installed version
+pub fn remove_version(version: &str) -> Result<()> {
+    let env_dir = config::envs_dir().join(version);
+    if !env_dir.exists() {
+        anyhow::bail!("Flutter {version} is not installed.");
+    }
+
+    // Check it's not the active global version
+    let current = get_current_version_name();
+    if current == version {
+        anyhow::bail!("Cannot remove the active global version. Switch to another version first.");
+    }
+
+    std::fs::remove_dir_all(&env_dir)?;
+    println!("🗑️  Removed Flutter {version}.");
+    println!("   (Cached engine artifacts remain. Run 'dartup gc' to free disk space.)");
+    Ok(())
+}
+
+/// Run doctor — verify installation
+pub fn run_doctor() -> Result<()> {
+    println!("{}", "dartup Doctor".bold());
+    println!();
+
+    // Check dartup home
+    let home = config::dartup_home();
+    if home.exists() {
+        println!("✅ dartup home: {}", home.display());
+    } else {
+        println!("⚠️  dartup home missing: {}", home.display());
+    }
+
+    // Check installed versions
+    let envs = std::fs::read_dir(config::envs_dir())?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .count();
+    println!("📦 Installed versions: {}", envs);
+
+    // Check global default
+    let global = config::global_default_path();
+    if global.is_symlink() {
+        if let Ok(target) = std::fs::read_link(&global) {
+            println!("🔗 Global default → {}", target.display());
+            // Verify the symlink target still exists
+            if target.exists() {
+                println!("✅ Global symlink target exists");
+            } else {
+                println!("❌ Global symlink target is broken!");
+            }
+        }
+    } else {
+        println!("ℹ️  No global default set");
+    }
+
+    // Check for disk usage
+    let envs_size = dir_size(config::envs_dir());
+    let cache_size = dir_size(config::engine_cache_dir());
+    let git_cache = dir_size(config::git_cache_dir());
+    println!("💾 Disk usage:");
+    println!("   Environments: {}", human_size(envs_size));
+    println!("   Engine cache: {}", human_size(cache_size));
+    println!("   Git cache:    {}", human_size(git_cache));
+    println!(
+        "   Total:        {}",
+        human_size(envs_size + cache_size + git_cache)
+    );
+
+    Ok(())
+}
