@@ -1,8 +1,10 @@
 use crate::config;
 use crate::engine_cache;
 use crate::git_cache;
+use crate::profile::Artifact;
 use crate::profile::Profile;
 use crate::releases;
+use crate::toolchain_meta;
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::ffi::OsStr;
@@ -229,24 +231,54 @@ pub fn install_version_git_with_profile(
         eprintln!("⚠️  Toolchain is not a lightweight worktree (.git is a directory)");
     }
 
-    if profile.includes_engine()
-        && let Ok(engine_ver) = engine_cache::read_engine_version(&env_dir)
-    {
-        if !engine_cache::engine_dir(&engine_ver).exists() {
-            println!("⚙️  Downloading engine {engine_ver}...");
-            let engine_clone = engine_ver.clone();
-            let engine_task =
-                std::thread::spawn(move || engine_cache::download_engine(&engine_clone));
-            let result = engine_task
-                .join()
-                .map_err(|_| anyhow::anyhow!("Engine download thread panicked"))??;
-            println!("⚙️  Engine cached at {}", result.display());
-        }
+    if let Ok(engine_ver) = engine_cache::read_engine_version(&env_dir) {
+        for artifact in profile.included_artifacts() {
+            match artifact {
+                Artifact::FlutterFramework | Artifact::HostDevTools => continue,
+                Artifact::HostEngine => {
+                    if !engine_cache::engine_dir(&engine_ver).exists() {
+                        println!("⚙️  Downloading engine {engine_ver}...");
+                        let engine_clone = engine_ver.clone();
+                        let engine_task = std::thread::spawn(move || {
+                            engine_cache::download_engine(&engine_clone)
+                        });
+                        let result = engine_task
+                            .join()
+                            .map_err(|_| anyhow::anyhow!("Engine download thread panicked"))??;
+                        println!("⚙️  Engine cached at {}", result.display());
+                    }
 
-        if let Err(e) = engine_cache::symlink_engine(&env_dir, &engine_ver) {
-            eprintln!("⚠️  Could not symlink engine: {e}");
+                    if let Err(e) = engine_cache::symlink_engine(&env_dir, &engine_ver) {
+                        eprintln!("⚠️  Could not symlink engine: {e}");
+                    }
+                }
+                _ => {
+                    let subdir = engine_cache::artifact_subdir(&artifact);
+                    let target = env_dir
+                        .join("bin")
+                        .join("cache")
+                        .join("artifacts")
+                        .join(subdir);
+                    if !target.exists() {
+                        match engine_cache::ensure_artifact(&engine_ver, &artifact) {
+                            Ok(cached) => {
+                                if let Some(parent) = target.parent() {
+                                    std::fs::create_dir_all(parent).ok();
+                                }
+                                engine_cache::symlink_dir(&cached, &target).ok();
+                            }
+                            Err(e) => {
+                                eprintln!("⚠️  Could not download {:?}: {e}", artifact);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
+
+    // Save profile to sidecar for future update/repair commands
+    toolchain_meta::save_profile(version, profile).ok();
 
     println!(
         "✅ Flutter {version} installed at {} (lightweight worktree)",
@@ -385,11 +417,43 @@ pub fn update_toolchain(version: &str, repo_url: Option<&str>) -> Result<()> {
         let engine_changed = old_engine_ver.as_deref() != Some(&new_engine_ver);
         if engine_changed || engine_corrupted {
             if let Some(ref old) = old_engine_ver
-                && old != &new_engine_ver {
-                    println!("🔁 Engine updated: {old} → {new_engine_ver}");
-                }
+                && old != &new_engine_ver
+            {
+                println!("🔁 Engine updated: {old} → {new_engine_ver}");
+            }
             if let Err(e) = engine_cache::symlink_engine(&env_dir, &new_engine_ver) {
                 eprintln!("⚠️  Could not symlink engine: {e}");
+            }
+        }
+
+        // Step 8: Dispatch platform artifacts based on sidecar profile
+        let update_profile = toolchain_meta::load_profile(version).unwrap_or(Profile::Default);
+        for artifact in update_profile.included_artifacts() {
+            match artifact {
+                Artifact::FlutterFramework | Artifact::HostDevTools | Artifact::HostEngine => {
+                    continue;
+                }
+                _ => {
+                    let subdir = engine_cache::artifact_subdir(&artifact);
+                    let target = env_dir
+                        .join("bin")
+                        .join("cache")
+                        .join("artifacts")
+                        .join(subdir);
+                    if !target.exists() {
+                        match engine_cache::ensure_artifact(&new_engine_ver, &artifact) {
+                            Ok(cached) => {
+                                if let Some(parent) = target.parent() {
+                                    std::fs::create_dir_all(parent).ok();
+                                }
+                                engine_cache::symlink_dir(&cached, &target).ok();
+                            }
+                            Err(e) => {
+                                eprintln!("⚠️  Could not download {:?}: {e}", artifact);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

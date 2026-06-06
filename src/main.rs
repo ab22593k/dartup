@@ -10,6 +10,7 @@ mod profile;
 mod project;
 mod releases;
 mod toolchain;
+mod toolchain_meta;
 mod util;
 
 use anyhow::Result;

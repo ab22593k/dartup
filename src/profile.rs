@@ -1,9 +1,11 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
 
 /// A Flutter SDK component that can be selected via a profile.
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Component {
     /// Flutter SDK framework + dart SDK (always included)
     Sdk,
@@ -19,16 +21,56 @@ pub enum Component {
     Desktop,
 }
 
+/// A specific downloadable Flutter SDK artifact.
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub enum Artifact {
+    /// Flutter framework source code (from git checkout)
+    FlutterFramework,
+    /// Host development tools: dart, dartanalyzer, dartfmt, dart2js, formatter, linter
+    HostDevTools,
+    /// Engine binary for the host platform (linux-x64, darwin-x64, windows-x64)
+    HostEngine,
+    /// Android engine — ARM 32-bit
+    AndroidEngineArm,
+    /// Android engine — ARM 64-bit
+    AndroidEngineArm64,
+    /// Android engine — x86 32-bit
+    AndroidEngineX86,
+    /// Android engine — x86 64-bit
+    AndroidEngineX64,
+    /// iOS device engine framework (arm64)
+    IosEngine,
+    /// iOS simulator engine framework
+    IosSimulator,
+    /// Web engine — CanvasKit renderer
+    WebEngineCanvaskit,
+    /// Web engine — Skwasm renderer
+    WebEngineSkwasm,
+    /// Web engine — HTML renderer
+    WebEngineHtml,
+    /// Linux desktop engine
+    DesktopLinux,
+    /// macOS desktop engine
+    DesktopMacos,
+    /// Windows desktop engine
+    DesktopWindows,
+}
+
 /// Installation profile, inspired by rustup.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "profile", content = "components")]
 pub enum Profile {
     /// Core Flutter SDK only — no engine
+    #[serde(rename = "minimal")]
     Minimal,
     /// SDK + engine for current platform
+    #[serde(rename = "default")]
     Default,
     /// SDK + engine + all platform artifacts
+    #[serde(rename = "full")]
     Full,
     /// User-defined component selection
+    #[serde(rename = "custom")]
     Custom(HashSet<Component>),
 }
 
@@ -57,6 +99,62 @@ impl Profile {
     /// Whether the profile includes engine download.
     pub fn includes_engine(&self) -> bool {
         self.components().contains(&Component::Engine)
+    }
+
+    /// Returns the set of specific artifacts included by this profile.
+    pub fn included_artifacts(&self) -> HashSet<Artifact> {
+        match self {
+            Profile::Minimal => HashSet::from([Artifact::FlutterFramework, Artifact::HostDevTools]),
+            Profile::Default => HashSet::from([
+                Artifact::FlutterFramework,
+                Artifact::HostDevTools,
+                Artifact::HostEngine,
+            ]),
+            Profile::Full => HashSet::from([
+                Artifact::FlutterFramework,
+                Artifact::HostDevTools,
+                Artifact::HostEngine,
+                Artifact::AndroidEngineArm,
+                Artifact::AndroidEngineArm64,
+                Artifact::AndroidEngineX64,
+                Artifact::AndroidEngineX86,
+                Artifact::IosEngine,
+                Artifact::IosSimulator,
+                Artifact::WebEngineCanvaskit,
+                Artifact::WebEngineSkwasm,
+                Artifact::WebEngineHtml,
+                Artifact::DesktopLinux,
+                Artifact::DesktopMacos,
+                Artifact::DesktopWindows,
+            ]),
+            Profile::Custom(comps) => {
+                let mut set = HashSet::from([Artifact::FlutterFramework, Artifact::HostDevTools]);
+                if comps.contains(&Component::Engine) {
+                    set.insert(Artifact::HostEngine);
+                }
+                if comps.contains(&Component::Android) {
+                    set.insert(Artifact::AndroidEngineArm);
+                    set.insert(Artifact::AndroidEngineArm64);
+                    set.insert(Artifact::AndroidEngineX64);
+                    set.insert(Artifact::AndroidEngineX86);
+                }
+                if comps.contains(&Component::Ios) {
+                    set.insert(Artifact::IosEngine);
+                    set.insert(Artifact::IosSimulator);
+                }
+                if comps.contains(&Component::Web) {
+                    set.insert(Artifact::WebEngineCanvaskit);
+                    set.insert(Artifact::WebEngineSkwasm);
+                    set.insert(Artifact::WebEngineHtml);
+                }
+                if comps.contains(&Component::Desktop) {
+                    set.insert(Artifact::DesktopLinux);
+                    set.insert(Artifact::DesktopMacos);
+                    set.insert(Artifact::DesktopWindows);
+                }
+                set
+            }
+        }
     }
 
     /// Whether the profile includes platform-specific artifacts beyond the engine.
@@ -299,6 +397,183 @@ mod tests {
     fn test_parse_custom_empty_returns_none() {
         assert_eq!(parse_custom(""), None);
         assert_eq!(parse_custom("foo,bar"), None);
+    }
+
+    // ---- Artifact-based profile mapping (RED: define expected behavior) ----
+
+    #[test]
+    fn test_minimal_artifacts_include_framework_and_tools() {
+        let artifacts = Profile::Minimal.included_artifacts();
+        assert!(artifacts.contains(&Artifact::FlutterFramework));
+        assert!(artifacts.contains(&Artifact::HostDevTools));
+        assert_eq!(artifacts.len(), 2);
+    }
+
+    #[test]
+    fn test_minimal_artifacts_exclude_all_engines() {
+        let artifacts = Profile::Minimal.included_artifacts();
+        assert!(!artifacts.contains(&Artifact::HostEngine));
+        assert!(!artifacts.contains(&Artifact::AndroidEngineArm));
+        assert!(!artifacts.contains(&Artifact::AndroidEngineArm64));
+        assert!(!artifacts.contains(&Artifact::AndroidEngineX64));
+        assert!(!artifacts.contains(&Artifact::AndroidEngineX86));
+        assert!(!artifacts.contains(&Artifact::IosEngine));
+        assert!(!artifacts.contains(&Artifact::IosSimulator));
+        assert!(!artifacts.contains(&Artifact::WebEngineCanvaskit));
+        assert!(!artifacts.contains(&Artifact::WebEngineSkwasm));
+        assert!(!artifacts.contains(&Artifact::WebEngineHtml));
+        assert!(!artifacts.contains(&Artifact::DesktopLinux));
+        assert!(!artifacts.contains(&Artifact::DesktopMacos));
+        assert!(!artifacts.contains(&Artifact::DesktopWindows));
+    }
+
+    #[test]
+    fn test_default_artifacts_include_host_engine() {
+        let artifacts = Profile::Default.included_artifacts();
+        assert!(artifacts.contains(&Artifact::FlutterFramework));
+        assert!(artifacts.contains(&Artifact::HostDevTools));
+        assert!(artifacts.contains(&Artifact::HostEngine));
+        assert!(!artifacts.contains(&Artifact::AndroidEngineArm64));
+        assert!(!artifacts.contains(&Artifact::IosEngine));
+        assert!(!artifacts.contains(&Artifact::DesktopLinux));
+        assert_eq!(artifacts.len(), 3);
+    }
+
+    #[test]
+    fn test_full_artifacts_include_all_platform_engines() {
+        let artifacts = Profile::Full.included_artifacts();
+        assert!(artifacts.contains(&Artifact::AndroidEngineArm));
+        assert!(artifacts.contains(&Artifact::AndroidEngineArm64));
+        assert!(artifacts.contains(&Artifact::AndroidEngineX64));
+        assert!(artifacts.contains(&Artifact::AndroidEngineX86));
+        assert!(artifacts.contains(&Artifact::IosEngine));
+        assert!(artifacts.contains(&Artifact::IosSimulator));
+        assert!(artifacts.contains(&Artifact::WebEngineCanvaskit));
+        assert!(artifacts.contains(&Artifact::WebEngineSkwasm));
+        assert!(artifacts.contains(&Artifact::WebEngineHtml));
+        assert!(artifacts.contains(&Artifact::DesktopLinux));
+        assert!(artifacts.contains(&Artifact::DesktopMacos));
+        assert!(artifacts.contains(&Artifact::DesktopWindows));
+        assert_eq!(artifacts.len(), 15);
+    }
+
+    #[test]
+    fn test_custom_with_component_engine_maps_to_host_engine_artifact() {
+        let p = Profile::Custom(HashSet::from([Component::Engine]));
+        let artifacts = p.included_artifacts();
+        assert!(artifacts.contains(&Artifact::FlutterFramework));
+        assert!(artifacts.contains(&Artifact::HostDevTools));
+        assert!(artifacts.contains(&Artifact::HostEngine));
+        assert!(!artifacts.contains(&Artifact::AndroidEngineArm64));
+    }
+
+    #[test]
+    fn test_custom_with_android_maps_to_all_android_architectures() {
+        let p = Profile::Custom(HashSet::from([Component::Android]));
+        let artifacts = p.included_artifacts();
+        assert!(artifacts.contains(&Artifact::AndroidEngineArm));
+        assert!(artifacts.contains(&Artifact::AndroidEngineArm64));
+        assert!(artifacts.contains(&Artifact::AndroidEngineX64));
+        assert!(artifacts.contains(&Artifact::AndroidEngineX86));
+        assert!(!artifacts.contains(&Artifact::HostEngine));
+        assert!(!artifacts.contains(&Artifact::IosEngine));
+    }
+
+    #[test]
+    fn test_custom_with_desktop_maps_to_all_desktop_artifacts() {
+        let p = Profile::Custom(HashSet::from([Component::Desktop]));
+        let artifacts = p.included_artifacts();
+        assert!(artifacts.contains(&Artifact::DesktopLinux));
+        assert!(artifacts.contains(&Artifact::DesktopMacos));
+        assert!(artifacts.contains(&Artifact::DesktopWindows));
+        assert_eq!(artifacts.len(), 5); // framework + tools + 3 desktop
+    }
+
+    // ---- RED: Expanded artifact model (Phase 1) ----
+
+    #[test]
+    fn test_full_profile_includes_all_android_architectures() {
+        let artifacts = Profile::Full.included_artifacts();
+        assert!(
+            artifacts.contains(&Artifact::AndroidEngineArm),
+            "Full should include AndroidEngineArm"
+        );
+        assert!(
+            artifacts.contains(&Artifact::AndroidEngineArm64),
+            "Full should include AndroidEngineArm64"
+        );
+        assert!(
+            artifacts.contains(&Artifact::AndroidEngineX64),
+            "Full should include AndroidEngineX64"
+        );
+        assert!(
+            artifacts.contains(&Artifact::AndroidEngineX86),
+            "Full should include AndroidEngineX86"
+        );
+    }
+
+    #[test]
+    fn test_full_profile_includes_all_web_renderers() {
+        let artifacts = Profile::Full.included_artifacts();
+        assert!(
+            artifacts.contains(&Artifact::WebEngineCanvaskit),
+            "Full should include WebEngineCanvaskit"
+        );
+        assert!(
+            artifacts.contains(&Artifact::WebEngineSkwasm),
+            "Full should include WebEngineSkwasm"
+        );
+        assert!(
+            artifacts.contains(&Artifact::WebEngineHtml),
+            "Full should include WebEngineHtml"
+        );
+    }
+
+    #[test]
+    fn test_full_profile_includes_ios_simulator() {
+        let artifacts = Profile::Full.included_artifacts();
+        assert!(
+            artifacts.contains(&Artifact::IosSimulator),
+            "Full should include IosSimulator"
+        );
+        assert!(
+            artifacts.contains(&Artifact::IosEngine),
+            "Full should include IosEngine (device)"
+        );
+    }
+
+    #[test]
+    fn test_custom_with_ios_includes_simulator() {
+        let p = Profile::Custom(HashSet::from([Component::Ios]));
+        let artifacts = p.included_artifacts();
+        assert!(
+            artifacts.contains(&Artifact::IosEngine),
+            "Custom(ios) should include IosEngine"
+        );
+        assert!(
+            artifacts.contains(&Artifact::IosSimulator),
+            "Custom(ios) should include IosSimulator"
+        );
+    }
+
+    #[test]
+    fn test_custom_with_web_maps_to_all_web_renderers() {
+        let p = Profile::Custom(HashSet::from([Component::Web]));
+        let artifacts = p.included_artifacts();
+        assert!(
+            artifacts.contains(&Artifact::WebEngineCanvaskit),
+            "Custom(web) should include WebEngineCanvaskit"
+        );
+        assert!(
+            artifacts.contains(&Artifact::WebEngineSkwasm),
+            "Custom(web) should include WebEngineSkwasm"
+        );
+        assert!(
+            artifacts.contains(&Artifact::WebEngineHtml),
+            "Custom(web) should include WebEngineHtml"
+        );
+        assert!(!artifacts.contains(&Artifact::HostEngine));
+        assert!(!artifacts.contains(&Artifact::AndroidEngineArm64));
     }
 
     // ---- Display ----
