@@ -1,5 +1,6 @@
 mod cache;
 mod cli;
+mod completions;
 mod config;
 mod engine_cache;
 mod environment;
@@ -13,9 +14,11 @@ mod toolchain_meta;
 mod util;
 
 use anyhow::Result;
-use clap::Parser;
-use cli::{Cli, Commands};
+use clap::{CommandFactory, Parser};
+use clap_complete::generate;
+use cli::{Cli, Commands, ShellVariant};
 use profile::Profile;
+use std::io;
 use std::str::FromStr;
 
 fn main() -> Result<()> {
@@ -41,6 +44,45 @@ fn main() -> Result<()> {
         Commands::Override { command } => match command {
             cli::OverrideCommands::Set { version } => toolchain::set_override(&version),
             cli::OverrideCommands::List => toolchain::list_overrides(),
+        },
+        Commands::Complete { kind } => match kind {
+            cli::CompleteKind::InstalledVersions => {
+                for v in completions::complete_installed_versions() {
+                    println!("{v}");
+                }
+                Ok(())
+            }
+            cli::CompleteKind::ReleaseVersions => {
+                for v in completions::complete_release_versions() {
+                    println!("{v}");
+                }
+                Ok(())
+            }
+        },
+        Commands::Completions { command } => match command {
+            cli::CompletionsCommands::Generate { shell } => {
+                generate(
+                    Into::<clap_complete::Shell>::into(shell),
+                    &mut Cli::command(),
+                    "dartup",
+                    &mut io::stdout(),
+                );
+                Ok(())
+            }
+            cli::CompletionsCommands::Install { shell } => {
+                let sv = shell.unwrap_or_else(|| {
+                    crate::completions::current_shell().unwrap_or(ShellVariant::Bash)
+                });
+                let com_shell = sv.into();
+                let dir = crate::completions::completion_dir_for_shell(sv);
+                crate::completions::install_completions(
+                    com_shell,
+                    &mut Cli::command(),
+                    dir.as_path(),
+                )?;
+                println!("Completions installed to {}", dir.display());
+                Ok(())
+            }
         },
         Commands::Toolchain { command } => match command {
             cli::ToolchainCommands::Install {

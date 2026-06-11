@@ -1,3 +1,4 @@
+use crate::completions;
 use crate::config;
 use crate::engine_cache;
 use crate::git_cache;
@@ -224,6 +225,19 @@ pub fn run_doctor() -> Result<()> {
         println!(
             "No global Git object cache. Create one with 'dartup toolchain install --git <version>'"
         );
+    }
+
+    // Shell completions
+    if let Some(shell) = completions::current_shell() {
+        if completions::is_completions_installed(shell) {
+            println!("Shell completions: {}", "installed".green().bold());
+        } else {
+            println!(
+                "Shell completions: {} ({})",
+                "not installed".yellow().bold(),
+                completions::install_hint(shell)
+            );
+        }
     }
 
     // Check for disk usage

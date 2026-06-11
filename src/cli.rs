@@ -1,4 +1,5 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 
 #[derive(Parser)]
 #[command(name = "dartup", about = "A fast Flutter version manager", version)]
@@ -40,6 +41,55 @@ pub enum Commands {
         #[command(subcommand)]
         command: ToolchainCommands,
     },
+    /// Shell completion management
+    Completions {
+        #[command(subcommand)]
+        command: CompletionsCommands,
+    },
+    /// (hidden) Dynamic completion source for shells
+    #[command(hide = true)]
+    Complete { kind: CompleteKind },
+}
+
+/// Completion source kind for dynamic arg completions
+#[derive(ValueEnum, Clone, Copy, PartialEq)]
+pub enum CompleteKind {
+    /// List installed toolchain versions
+    InstalledVersions,
+    /// List available release versions
+    ReleaseVersions,
+}
+
+#[derive(Subcommand)]
+pub enum CompletionsCommands {
+    /// Generate and print completion script for the given shell
+    Generate { shell: ShellVariant },
+    /// Install shell completions to the system
+    Install {
+        /// Shell type (auto-detected from $SHELL if not specified)
+        shell: Option<ShellVariant>,
+    },
+}
+
+#[derive(Debug, ValueEnum, Clone, Copy, PartialEq)]
+pub enum ShellVariant {
+    Bash,
+    Zsh,
+    Fish,
+    PowerShell,
+    Elvish,
+}
+
+impl From<ShellVariant> for Shell {
+    fn from(v: ShellVariant) -> Self {
+        match v {
+            ShellVariant::Bash => Shell::Bash,
+            ShellVariant::Zsh => Shell::Zsh,
+            ShellVariant::Fish => Shell::Fish,
+            ShellVariant::PowerShell => Shell::PowerShell,
+            ShellVariant::Elvish => Shell::Elvish,
+        }
+    }
 }
 
 #[derive(Subcommand)]
