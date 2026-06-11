@@ -96,19 +96,64 @@ pub fn fetch(remote_url: &str, refspecs: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Fetch only the refs needed for a specific version, with `--depth=1` (shallow).
+/// Tries the version as a tag first, then as a branch. Returns an error if neither
+/// ref exists on the remote, allowing callers to fall back to the wide refspec fetch.
+///
+/// Each refspec is tried in a separate `git fetch` call — git refuses the entire
+/// operation if *any* refspec in a batch fails to match a remote ref, so we cannot
+/// combine them in a single command.
+pub fn fetch_single_ref(remote_url: &str, version: &str) -> Result<()> {
+    let git_cache = git_cache_path();
+    ensure_initialized()?;
+
+    let refspecs = [
+        format!("+refs/tags/{version}:refs/tags/{version}"),
+        format!("+refs/heads/{version}:refs/heads/{version}"),
+    ];
+
+    for refspec in &refspecs {
+        let output = std::process::Command::new("git")
+            .args([
+                OsStr::new("--git-dir"),
+                OsStr::new(git_cache.to_str().unwrap()),
+                OsStr::new("fetch"),
+                OsStr::new("--depth"),
+                OsStr::new("1"),
+                OsStr::new(remote_url),
+                OsStr::new(refspec.as_str()),
+            ])
+            .output()
+            .context("Failed to run git fetch --depth")?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!("Could not fetch '{version}' as a tag or branch");
+}
+
 /// Clone a repository into a toolchain directory using the central cache.
 /// Sets up alternates so objects are shared, not duplicated.
+///
+/// First tries a targeted shallow fetch (`fetch_single_ref`) that downloads only
+/// the objects reachable from the single requested tag or branch (~150–200 MiB
+/// for Flutter). Falls back to the wide refspec fetch (`+refs/heads/* +refs/tags/*`)
+/// which downloads the full history (~1.44 GiB) if the targeted fetch fails.
 pub fn clone_via_cache(version: &str, remote_url: &str) -> Result<PathBuf> {
     let env_dir = config::envs_dir().join(version);
 
     // Ensure cache exists
     ensure_initialized()?;
 
-    // Fetch into cache first
-    fetch(
-        remote_url,
-        &["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"],
-    )?;
+    // Try targeted shallow fetch first; fall back to wide fetch
+    if fetch_single_ref(remote_url, version).is_err() {
+        fetch(
+            remote_url,
+            &["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"],
+        )?;
+    }
 
     create_lightweight_toolchain(&env_dir, version)
 }
@@ -808,5 +853,245 @@ mod tests {
     fn test_fetch_depth_rejects_zero_depth() {
         let result = super::fetch_depth("https://example.com/repo.git", 0);
         assert!(result.is_err(), "depth 0 should be rejected");
+    }
+
+    // ---- RED: targeted shallow fetch tests ----
+
+    #[test]
+    fn test_fetch_single_refspec_creates_shallow_clone() {
+        let tmp = temp_dir();
+
+        // Create source repo with a commit and a tag
+        let src_dir = tmp.join("source");
+        let src = git2::Repository::init(&src_dir).unwrap();
+        std::fs::write(src_dir.join("f.txt"), b"data").unwrap();
+        let sig = git2::Signature::now("test", "test@test.com").unwrap();
+        {
+            let mut index = src.index().unwrap();
+            index.add_path(std::path::Path::new("f.txt")).unwrap();
+            index.write().unwrap();
+            let tree = src.find_tree(index.write_tree().unwrap()).unwrap();
+            let oid = src
+                .commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+            let commit = src.find_commit(oid).unwrap();
+            src.tag("v3.29.0", commit.as_object(), &sig, "v3.29.0", false)
+                .unwrap();
+        }
+        drop(src);
+
+        let cache_dir = tmp.join("cache.git");
+        let cache = git2::Repository::init_bare(&cache_dir).unwrap();
+        drop(cache);
+
+        // Fetch single tag with depth=1
+        let output = std::process::Command::new("git")
+            .args([
+                OsStr::new("--git-dir"),
+                OsStr::new(cache_dir.to_str().unwrap()),
+                OsStr::new("fetch"),
+                OsStr::new("--depth"),
+                OsStr::new("1"),
+                OsStr::new(src_dir.to_str().unwrap()),
+                OsStr::new("+refs/tags/v3.29.0:refs/tags/v3.29.0"),
+            ])
+            .output()
+            .expect("git fetch --depth");
+        assert!(
+            output.status.success(),
+            "fetch failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let shallow_file = cache_dir.join("shallow");
+        assert!(
+            shallow_file.exists(),
+            "shallow marker should exist after depth=1 fetch"
+        );
+
+        let opened = git2::Repository::open_bare(&cache_dir).unwrap();
+        assert!(
+            opened.refname_to_id("refs/tags/v3.29.0").is_ok(),
+            "tag should be fetched"
+        );
+        drop(opened);
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_fetch_single_refspec_does_scope_to_requested_refs() {
+        let tmp = temp_dir();
+
+        // Source with a tag and a detached branch
+        let src_dir = tmp.join("source");
+        let src = git2::Repository::init(&src_dir).unwrap();
+        std::fs::write(src_dir.join("f.txt"), b"data").unwrap();
+        let sig = git2::Signature::now("test", "test@test.com").unwrap();
+        {
+            let mut index = src.index().unwrap();
+            index.add_path(std::path::Path::new("f.txt")).unwrap();
+            index.write().unwrap();
+            let tree = src.find_tree(index.write_tree().unwrap()).unwrap();
+            let oid = src
+                .commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+            let commit = src.find_commit(oid).unwrap();
+            src.tag("v3.29.0", commit.as_object(), &sig, "v3.29.0", false)
+                .unwrap();
+        }
+        drop(src);
+
+        // Add a branch that fetcher should NOT fetch
+        let src = git2::Repository::open(&src_dir).unwrap();
+        let head_id = src
+            .refname_to_id("refs/heads/master")
+            .unwrap_or_else(|_| src.refname_to_id("refs/heads/main").unwrap());
+        src.branch(
+            "unrelated-feature",
+            &src.find_commit(head_id).unwrap(),
+            false,
+        )
+        .unwrap();
+        drop(src);
+
+        let cache_dir = tmp.join("cache.git");
+        let cache = git2::Repository::init_bare(&cache_dir).unwrap();
+        drop(cache);
+
+        // Fetch only v3.29.0 tag
+        let output = std::process::Command::new("git")
+            .args([
+                OsStr::new("--git-dir"),
+                OsStr::new(cache_dir.to_str().unwrap()),
+                OsStr::new("fetch"),
+                OsStr::new("--depth"),
+                OsStr::new("1"),
+                OsStr::new(src_dir.to_str().unwrap()),
+                OsStr::new("+refs/tags/v3.29.0:refs/tags/v3.29.0"),
+            ])
+            .output()
+            .expect("git fetch --depth");
+        assert!(
+            output.status.success(),
+            "fetch failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let opened = git2::Repository::open_bare(&cache_dir).unwrap();
+
+        // Requested tag must be present
+        assert!(
+            opened.refname_to_id("refs/tags/v3.29.0").is_ok(),
+            "v3.29.0 tag should be fetched"
+        );
+
+        // Unrelated branch must NOT be fetched (branches are never auto-followed)
+        assert!(
+            opened
+                .refname_to_id("refs/heads/unrelated-feature")
+                .is_err(),
+            "unrelated branch should NOT be fetched"
+        );
+
+        drop(opened);
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_fetch_single_refspec_fails_for_nonexistent_ref() {
+        let tmp = temp_dir();
+
+        let src_dir = tmp.join("source");
+        let src = git2::Repository::init(&src_dir).unwrap();
+        std::fs::write(src_dir.join("f.txt"), b"data").unwrap();
+        let sig = git2::Signature::now("test", "test@test.com").unwrap();
+        {
+            let mut index = src.index().unwrap();
+            index.add_path(std::path::Path::new("f.txt")).unwrap();
+            index.write().unwrap();
+            let tree = src.find_tree(index.write_tree().unwrap()).unwrap();
+            let oid = src
+                .commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+            let commit = src.find_commit(oid).unwrap();
+            src.tag("v3.29.0", commit.as_object(), &sig, "v3.29.0", false)
+                .unwrap();
+        }
+        drop(src);
+
+        let cache_dir = tmp.join("cache.git");
+        let cache = git2::Repository::init_bare(&cache_dir).unwrap();
+        drop(cache);
+
+        // This refspec won't match anything — git should fail
+        let output = std::process::Command::new("git")
+            .args([
+                OsStr::new("--git-dir"),
+                OsStr::new(cache_dir.to_str().unwrap()),
+                OsStr::new("fetch"),
+                OsStr::new("--depth"),
+                OsStr::new("1"),
+                OsStr::new(src_dir.to_str().unwrap()),
+                OsStr::new("+refs/tags/v99.99.99:refs/tags/v99.99.99"),
+            ])
+            .output()
+            .expect("git fetch --depth");
+        assert!(
+            !output.status.success(),
+            "fetch should fail for nonexistent ref"
+        );
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_fetch_single_refspec_with_branch() {
+        let tmp = temp_dir();
+
+        let src_dir = tmp.join("source");
+        let src = git2::Repository::init(&src_dir).unwrap();
+        std::fs::write(src_dir.join("f.txt"), b"data").unwrap();
+        let sig = git2::Signature::now("test", "test@test.com").unwrap();
+        {
+            let mut index = src.index().unwrap();
+            index.add_path(std::path::Path::new("f.txt")).unwrap();
+            index.write().unwrap();
+            let tree = src.find_tree(index.write_tree().unwrap()).unwrap();
+            src.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+        }
+        drop(src);
+
+        let cache_dir = tmp.join("cache.git");
+        let cache = git2::Repository::init_bare(&cache_dir).unwrap();
+        drop(cache);
+
+        let output = std::process::Command::new("git")
+            .args([
+                OsStr::new("--git-dir"),
+                OsStr::new(cache_dir.to_str().unwrap()),
+                OsStr::new("fetch"),
+                OsStr::new("--depth"),
+                OsStr::new("1"),
+                OsStr::new(src_dir.to_str().unwrap()),
+                OsStr::new("+refs/heads/main:refs/heads/main"),
+            ])
+            .output()
+            .expect("git fetch --depth");
+        assert!(
+            output.status.success(),
+            "fetch should succeed for existing branch: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let opened = git2::Repository::open_bare(&cache_dir).unwrap();
+        assert!(
+            opened.refname_to_id("refs/heads/main").is_ok(),
+            "branch main should be present"
+        );
+        drop(opened);
+
+        fs::remove_dir_all(&tmp).unwrap();
     }
 }

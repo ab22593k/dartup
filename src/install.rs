@@ -128,6 +128,18 @@ pub fn install_version(version: &str, force: bool, profile: &Profile) -> Result<
 
     println!("📦 Installing Flutter {version} ({})", release.channel);
 
+    // Warn when profile expects a smaller download but archive path always gets the full tarball
+    if !profile.includes_engine() {
+        println!(
+            "⚠️  Profile doesn't include engine, but the full release archive (~1.44 GiB) \
+            will still be downloaded."
+        );
+        println!(
+            "   💡 Use `dartup toolchain install {version} --git --profile minimal` \
+            to shallow-clone only the SDK source (~150-200 MiB)."
+        );
+    }
+
     // Create temp directory for download
     let tmp_dir = config::dartup_home().join(".tmp");
     std::fs::create_dir_all(&tmp_dir)?;
@@ -306,10 +318,13 @@ pub fn update_toolchain(version: &str, repo_url: Option<&str>) -> Result<()> {
     println!("📡 Updating {version} from {remote}...");
 
     // Step 1: Fetch new objects into the shared cache
-    git_cache::fetch(
-        remote,
-        &["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"],
-    )?;
+    // Try targeted shallow fetch first (~150–200 MiB); fall back to wide fetch (~1.44 GiB)
+    if git_cache::fetch_single_ref(remote, version).is_err() {
+        git_cache::fetch(
+            remote,
+            &["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"],
+        )?;
+    }
 
     // Step 2: Git dir of the worktree's parent bare repo
     let git_cache_path = git_cache::git_cache_path();
